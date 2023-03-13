@@ -16,6 +16,10 @@
 #include <unistd.h>
 #endif
 
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+
 #define ANSI_COLOR_RED     "\x1b[31m"
 #define ANSI_COLOR_GREEN   "\x1b[32m"
 #define ANSI_COLOR_YELLOW  "\x1b[33m"
@@ -785,7 +789,7 @@ const char * llama_print_system_info(void) {
     return s.c_str();
 }
 
-int main(int argc, char ** argv) {
+int _main_console(int argc, char ** argv) {
     ggml_time_init();
     const int64_t t_main_start_us = ggml_time_us();
 
@@ -1048,6 +1052,199 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s:   sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
         fprintf(stderr, "%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us/1000.0f, t_predict_us/1000.0f/n_past);
         fprintf(stderr, "%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
+    }
+
+    ggml_free(model.ctx);
+
+    return 0;
+}
+
+
+int main(int argc, char ** argv) {
+    // implementing unix server in this main function
+    ggml_time_init();
+
+    gpt_params params;
+    params.model = "models/llama-7B/ggml-model.bin";
+
+    if (gpt_params_parse(argc, argv, params) == false) {
+        return 1;
+    }
+
+    if (!params.server_mode) {
+        printf("Only server mode is supported\n");
+        return 1;
+    }
+
+    if (params.seed < 0) {
+        params.seed = time(NULL);
+    }
+
+    printf("%s: seed = %d\n", __func__, params.seed);
+
+    std::mt19937 rng(params.seed);
+
+    gpt_vocab vocab;
+    llama_model model;
+
+    // load the model
+    {
+        if (!llama_model_load(params.model, model, vocab, 512)) {
+            fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
+            return 1;
+        }
+    }
+
+    // ## unix server mode
+    // accept connections one by one in a loop
+    // recv initial prompt, generate response, send response, close connection
+    unlink("/tmp/llama.sock");
+
+    // create a socket
+    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        exit(1);
+    }
+
+    // bind the socket to a file
+    struct sockaddr_un addr;
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "/tmp/llama.sock");
+    if (bind(sockfd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        perror("bind");
+        exit(1);
+    }
+
+    // listen for connections
+    if (listen(sockfd, 5) < 0) {
+        perror("listen");
+        exit(1);
+    }
+
+    std::vector<float> logits;
+
+    // determine the required inference memory per token:
+    size_t mem_per_token = 0;
+    llama_eval(model, params.n_threads, 0, { 0, 1, 2, 3 }, logits, mem_per_token);
+
+    int last_n_size = params.repeat_last_n;
+    std::vector<gpt_vocab::id> last_n_tokens(last_n_size);
+    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
+
+    while (1) {
+        int connfd = accept(sockfd, NULL, NULL);
+        if (connfd < 0) {
+            perror("accept");
+            continue;
+        }
+        printf("\n---\n\naccepted connection\n");
+
+        rng.seed(time(NULL));
+
+        uint32_t msg_len;
+        if (recv(connfd, &msg_len, sizeof(msg_len), MSG_WAITALL) != sizeof(msg_len)) {
+            perror("recv");
+            continue;
+        }
+        printf("msg_len: %d\n", msg_len);
+
+        std::vector<char> msg(msg_len);
+        if (recv(connfd, msg.data(), msg_len, MSG_WAITALL) != msg_len) {
+            perror("recv");
+            continue;
+        }
+
+        std::string msg_str = std::string(msg.data(), msg_len);
+        printf("prompt: %s\n", msg_str.c_str());
+
+        uint32_t n_predict;
+        if (recv(connfd, &n_predict, sizeof(n_predict), MSG_WAITALL) != sizeof(n_predict)) {
+            perror("recv");
+            continue;
+        }
+
+        printf("n_predict: %d\n", n_predict);
+        fflush(stdout);
+
+        int n_past = 0;
+
+        // tokenize the prompt
+        std::vector<gpt_vocab::id> embd_inp = ::llama_tokenize(vocab, msg_str, true);
+        std::vector<gpt_vocab::id> embd;
+
+        int remaining_tokens = n_predict;
+        int input_consumed = 0;
+
+        while (remaining_tokens > 0) {
+            // predict
+            if (embd.size() > 0) {
+                const int64_t t_start_us = ggml_time_us();
+
+                if (!llama_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
+                    printf("Failed to predict\n");
+                    return 1;
+                }
+            }
+
+            n_past += embd.size();
+            embd.clear();
+
+            if (embd_inp.size() <= input_consumed) {
+                // out of user input, sample next token
+                const float top_k = params.top_k;
+                const float top_p = params.top_p;
+                const float temp  = params.temp;
+                const float repeat_penalty = params.repeat_penalty;
+
+                const int n_vocab = model.hparams.n_vocab;
+
+                gpt_vocab::id id = 0;
+
+                {
+                    id = llama_sample_top_p_top_k(vocab, logits.data() + (logits.size() - n_vocab), last_n_tokens, repeat_penalty, top_k, top_p, temp, rng);
+
+                    last_n_tokens.erase(last_n_tokens.begin());
+                    last_n_tokens.push_back(id);
+                }
+
+                // add it to the context
+                embd.push_back(id);
+
+                // decrement remaining sampling budget
+                --remaining_tokens;
+            } else {
+                // some user input remains from prompt or interaction, forward it to processing
+                while (embd_inp.size() > input_consumed) {
+                    embd.push_back(embd_inp[input_consumed]);
+                    last_n_tokens.erase(last_n_tokens.begin());
+                    last_n_tokens.push_back(embd_inp[input_consumed]);
+                    ++input_consumed;
+                    if (embd.size() > params.n_batch) {
+                        break;
+                    }
+                }
+            }
+
+            for (auto id : embd) {
+                printf("%s", vocab.id_to_token[id].c_str());
+                fflush(stdout);
+                // send the token as str
+                uint32_t token_len = vocab.id_to_token[id].size();
+                if (send(connfd, vocab.id_to_token[id].c_str(), token_len, 0) != token_len) {
+                    perror("send");
+                    continue;
+                }
+            }
+
+            // end of text token
+            if (embd.back() == 2) {
+                printf(" [end of text]\n");
+                break;
+            }
+        }
+
+        close(connfd);
     }
 
     ggml_free(model.ctx);

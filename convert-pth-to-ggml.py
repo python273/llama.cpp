@@ -20,8 +20,10 @@
 import sys
 import json
 import struct
+import zipfile
 import numpy as np
-import torch
+import pickle
+from math import prod
 from sentencepiece import SentencePieceProcessor
 
 if len(sys.argv) < 3:
@@ -29,6 +31,53 @@ if len(sys.argv) < 3:
     print("  ftype == 0 -> float32")
     print("  ftype == 1 -> float16")
     sys.exit(1)
+
+class Tensor:
+    def __init__(self, shape, dtype, loadinfo):
+        self.shape = shape
+        self.dtype = dtype
+        self.loadinfo = loadinfo
+
+    def numpy(self):
+        fname_model, base_name, storage_offset, k, shape, dtype = self.loadinfo
+        with zipfile.ZipFile(fname_model, 'r') as myzip:
+            with myzip.open(f'{base_name}/data/{k}') as myfile:
+                bytes_size = np.dtype(self.dtype).itemsize
+                myfile.seek(storage_offset * bytes_size, 1)
+
+                ret = np.empty(shape, dtype=dtype)
+                myfile.readinto(ret.data)
+                return ret
+
+
+def my_unpickle(myfile, fname_model, base_name):
+    def fake_rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad, backward_hooks, metadata=None):
+        storage_type = storage[1]
+        obj_key = storage[2]
+        return Tensor(shape=size, dtype=storage_type, loadinfo=(
+            fname_model, base_name, storage_offset,
+            obj_key, size, storage_type
+        ))
+
+    class MyPickle(pickle.Unpickler):
+        def find_class(self, *p):
+            if p == ('torch', 'HalfStorage'): return np.float16
+            if p == ('torch', 'FloatStorage'): return np.float32
+            if p == ('torch._utils', '_rebuild_tensor_v2'): return fake_rebuild_tensor_v2
+            if p == ('collections', 'OrderedDict'): return dict
+            raise ValueError(f'Unrecognized pickle {p}')
+
+        def persistent_load(self, pid):
+            return pid
+
+    return MyPickle(myfile).load()
+
+def fake_torch_load_zipped(fname_model):
+    with zipfile.ZipFile(fname_model, 'r') as myzip:
+        base_name = myzip.namelist()[0].split('/', 1)[0]
+        with myzip.open(f'{base_name}/data.pkl') as myfile:
+            model = my_unpickle(myfile, fname_model, base_name)
+    return model
 
 # output in the same directory as the model
 dir_model = sys.argv[1]
@@ -85,7 +134,7 @@ for p in range(n_parts):
     if (p > 0):
         fname_out = sys.argv[1] + "/ggml-model-" + ftype_str[ftype] + ".bin" + "." + str(p)
 
-    model = torch.load(fname_model, map_location="cpu")
+    model = fake_torch_load_zipped(fname_model)
 
     fout = open(fname_out, "wb")
 
@@ -123,19 +172,16 @@ for p in range(n_parts):
             fout.write(struct.pack("i", len(text)))
             fout.write(text)
 
-    for k, v in model.items():
-        name = k
-        shape = v.shape
-
+    for name, v in model.items():
         # skip layers.X.attention.inner_attention.rope.freqs
         if name[-5:] == "freqs":
             continue
 
-        print("Processing variable: " + name + " with shape: ", shape, " and type: ", v.dtype)
+        print("Processing variable: " + name + " with shape: ", tuple(v.shape), " and type: ", v.dtype)
 
         #data = tf.train.load_variable(dir_model, name).squeeze()
         data = v.numpy().squeeze()
-        n_dims = len(data.shape);
+        n_dims = len(data.shape)
 
         # for efficiency - transpose some matrices
         # "model/h.*/attn/c_attn/w"
@@ -163,7 +209,7 @@ for p in range(n_parts):
         fout.write(struct.pack("iii", n_dims, len(sname), ftype_cur))
         for i in range(n_dims):
             fout.write(struct.pack("i", dshape[n_dims - 1 - i]))
-        fout.write(sname);
+        fout.write(sname)
 
         # data
         data.tofile(fout)
